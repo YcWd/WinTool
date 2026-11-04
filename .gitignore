@@ -1,3 +1,9 @@
 dist/
 *.pdb
 .idea/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+build/
+windows/flutter/ephemeral/
+windows/flutter/generated_*

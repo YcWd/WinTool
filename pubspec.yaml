@@ -1,0 +1,11 @@
+name: win_tool
+description: Windows clipboard history and developer field translator.
+publish_to: none
+version: 1.0.0+5
+environment:
+  sdk: '>=3.4.0 <4.0.0'
+dependencies:
+  flutter:
+    sdk: flutter
+flutter:
+  uses-material-design: true

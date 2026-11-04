@@ -75,3 +75,7 @@
 - [微软：Segoe MDL2 Assets 图标](https://learn.microsoft.com/zh-cn/windows/apps/design/iconography/segoe-ui-symbol-font)
 
 系统效果由 Windows DWM 渲染。本次未构建及运行验收；需打包后在 Windows 11 实际确认阴影、圆角、拖动、缩放、置顶与失焦收起。
+
+## Flutter 迁移说明
+
+当前界面实现位于 `lib/`，配色、圆角和字体沿用以上规范。原有 WinForms 控件及绘制类保留作迁移参考，当前打包流程使用 Flutter Windows runner。窗口消息、托盘、剪贴板和快捷键由 `windows/native/` 提供。以上涉及 WinForms 控件名和绘制实现的说明属于旧版实现记录，Flutter 的实际布局与交互仍需桌面运行验收。

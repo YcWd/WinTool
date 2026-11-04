@@ -65,11 +65,11 @@ namespace ClipHistory
         }
 
         // 当前用户登录后在托盘启动，注册当前 EXE 路径并移除旧名称。
-        internal static void SetStartup(bool enabled)
+        internal static void SetStartup(bool enabled, string executablePath = null)
         {
             using (var key = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run"))
             {
-                if (enabled) key.SetValue("winTool", "\"" + Application.ExecutablePath + "\" --tray", RegistryValueKind.String);
+                if (enabled) key.SetValue("winTool", "\"" + (executablePath ?? Application.ExecutablePath) + "\" --tray", RegistryValueKind.String);
                 else key.DeleteValue("winTool", false);
                 key.DeleteValue("WinToolClipboardHistory", false);
             }
