@@ -40,20 +40,19 @@ namespace ClipHistory
 
     internal sealed class HistoryStore
     {
-        private const int RecordLimit = 100;
+        private int recordLimit;
         internal readonly string Root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WinTool", "ClipboardHistory");
         private readonly DataContractJsonSerializer serializer = new DataContractJsonSerializer(typeof(ClipRecord));
         private readonly Dictionary<string, string> latestVersions = new Dictionary<string, string>();
         private readonly List<ClipRecord> recentRecords = new List<ClipRecord>();
         internal long Count { get { return latestVersions.Count; } }
 
-        // 准备数据目录，启动时将已有历史清理至最近 100 条。
+        // 准备数据目录与索引，数量上限在读取用户设置后应用。
         internal HistoryStore()
         {
             Directory.CreateDirectory(Path.Combine(Root, "records"));
             Directory.CreateDirectory(Path.Combine(Root, "images"));
             LoadIndex();
-            TrimHistory();
             DateTime cutoff = DateTime.Now.AddSeconds(-60);
             recentRecords.Clear();
             recentRecords.AddRange(Read("", "全部类型")
@@ -81,12 +80,19 @@ namespace ClipHistory
             DeleteUnusedImages();
         }
 
-        // 按复制时间保留最近 100 条，置顶仅影响展示顺序，不豁免数量限制。
+        // 应用记录总数配置，并立即清理超出上限的历史。
+        internal void SetRecordLimit(int limit)
+        {
+            recordLimit = limit;
+            TrimHistory();
+        }
+
+        // 按复制时间保留用户设置的条数，置顶记录同样计入上限。
         private void TrimHistory()
         {
-            if (Count <= RecordLimit) return;
+            if (Count <= recordLimit) return;
             var retainedIds = new HashSet<string>(Read("", "全部类型")
-                .OrderByDescending(r => r.LocalTime).Take(RecordLimit).Select(r => r.Id));
+                .OrderByDescending(r => r.LocalTime).Take(recordLimit).Select(r => r.Id));
             RewriteLogs(r => retainedIds.Contains(r.Id) && (r.Revision ?? r.CapturedAt) == latestVersions[r.Id]);
             DeleteUnusedImages();
         }
@@ -174,7 +180,7 @@ namespace ClipHistory
             return result.OrderByDescending(r => r.IsPinned).ThenByDescending(r => r.LocalTime).ToList();
         }
 
-        // 间隔内相同内容沿用原 ID，写入后淘汰超出最近 100 条的记录。
+        // 间隔内相同内容沿用原 ID，写入后按用户设置淘汰超额记录。
         internal bool Append(ClipRecord record, Image image, int duplicateSeconds)
         {
             record.Revision = record.Id;

@@ -14,6 +14,7 @@ namespace ClipHistory
         [DataMember] public uint HotkeyKey { get; set; }
         [DataMember] public int DuplicateSeconds { get; set; }
         [DataMember] public bool DockBottom { get; set; }
+        [DataMember] public int RecordLimit { get; set; }
 
         internal string HotkeyText
         {
@@ -30,9 +31,16 @@ namespace ClipHistory
         internal static AppSettings Load(string root)
         {
             string path = Path.Combine(root, "settings.json");
-            if (!File.Exists(path)) return new AppSettings { HotkeyModifiers = 3, HotkeyKey = 0x56, DuplicateSeconds = 3 };
+            if (!File.Exists(path)) return new AppSettings { HotkeyModifiers = 3, HotkeyKey = 0x56, DuplicateSeconds = 3, RecordLimit = 100 };
             using (var stream = File.OpenRead(path))
                 return (AppSettings)new DataContractJsonSerializer(typeof(AppSettings)).ReadObject(stream);
+        }
+
+        // 旧配置没有记录总数时，沿用原来的 100 条上限。
+        [OnDeserializing]
+        private void InitializeRecordLimit(StreamingContext context)
+        {
+            RecordLimit = 100;
         }
 
         // 原子替换设置文件，保存成功后才应用到界面。

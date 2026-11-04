@@ -82,6 +82,7 @@ namespace ClipHistory
             thumbnails = new ThumbnailCache(store);
             startInTray = trayOnly;
             settings = AppSettings.Load(store.Root);
+            store.SetRecordLimit(settings.RecordLimit);
             targetWindow = NativeMethods.GetForegroundWindow();
             Text = "剪贴记录";
             Icon = applicationIcon;
@@ -264,7 +265,7 @@ namespace ClipHistory
             toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 54));
             search.Font = rowFont;
-            search.AccessibleName = "搜索最近 100 条记录的内容、文件名或来源窗口";
+            search.AccessibleName = "搜索历史记录的内容、文件名或来源窗口";
             search.TextChanged += delegate { ScheduleFilter(); };
             searchField = new SearchField(search) { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 8, 0) };
             toolbar.Controls.Add(searchField, 0, 0);
@@ -429,7 +430,12 @@ namespace ClipHistory
             };
             menu.Items.Add(trayStartup);
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("退出", null, delegate { exiting = true; Close(); });
+            menu.Items.Add("退出", null, delegate
+            {
+                Program.WriteDiagnostic("用户点击托盘退出。");
+                exiting = true;
+                Close();
+            });
             menu.Opening += delegate { trayStartup.Checked = AppSettings.StartupEnabled; };
             tray.Icon = Icon;
             tray.ContextMenuStrip = menu;
@@ -490,7 +496,7 @@ namespace ClipHistory
             }
         }
 
-        // 先验证新快捷键可注册，保存成功后释放旧快捷键。
+        // 保存配置后应用快捷键、布局及记录上限，刷新清理后的列表。
         private string ApplySettings(AppSettings candidate, bool startup)
         {
             if (candidate.HotkeyModifiers == 1 && candidate.HotkeyKey == (uint)Keys.D2)
@@ -521,9 +527,22 @@ namespace ClipHistory
                 hotkeyRegistered = true;
             }
             bool changeLayout = settings.DockBottom != candidate.DockBottom;
+            bool changeRecordLimit = settings.RecordLimit != candidate.RecordLimit;
             settings = candidate;
             if (changeLayout) ApplyWindowLayout();
             UpdateSettingsLabels();
+            if (changeRecordLimit || store.Count > settings.RecordLimit)
+            {
+                try { store.SetRecordLimit(settings.RecordLimit); }
+                catch (IOException exception) { return "设置已保存，记录数量清理未完成：" + exception.Message; }
+                catch (UnauthorizedAccessException exception) { return "设置已保存，记录数量清理未完成：" + exception.Message; }
+                catch (SerializationException exception) { return "设置已保存，历史日志格式错误：" + exception.Message; }
+                finally
+                {
+                    thumbnails.Clear();
+                    ReloadRecords();
+                }
+            }
             try { AppSettings.SetStartup(startup); }
             catch (UnauthorizedAccessException)
             {
@@ -737,7 +756,7 @@ namespace ClipHistory
             filterTimer.Start();
         }
 
-        // 在最近 100 条历史中筛选，实时复制时保留当前滚动位置。
+        // 在当前保留的历史中筛选，实时复制时保留当前滚动位置。
         private void ReloadRecords(bool preservePosition = false)
         {
             try
@@ -1222,6 +1241,8 @@ namespace ClipHistory
                 Hide();
             }
             base.OnFormClosing(e);
+            Program.WriteDiagnostic("主窗口关闭请求；原因=" + e.CloseReason + "；取消关闭=" + e.Cancel +
+                "；托盘退出=" + exiting);
         }
 
         // 释放系统监听、快捷键、计时器与托盘资源。
