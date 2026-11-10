@@ -62,15 +62,62 @@ class _HistoryPageState extends State<HistoryPage> {
     bridge.perform(method, {'id': record['Id']});
   }
 
-  // 完整预览支持文本选择与图片缩放，并展示复制时间和来源。
+  // 图片使用可缩放的全窗口预览，底部模式也能充分利用可用空间。
   void preview(Map<String, dynamic> record) {
+    if (record['Kind'] == '图片') {
+      showDialog<void>(
+        context: context,
+        builder: (context) => Dialog.fullscreen(
+          backgroundColor: const Color(0xFF17191C),
+          child: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.only(left: 16, right: 4),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Tooltip(
+                        message: '${record['CapturedAt']} · ${record['Source']}',
+                        child: Text(
+                          record['Text'] as String,
+                          style: const TextStyle(fontSize: 14, color: Colors.white),
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: '关闭预览',
+                      onPressed: () => Navigator.pop(context),
+                      icon: const Icon(Icons.close, color: Colors.white, size: 20),
+                    ),
+                  ],
+                ),
+              ),
+              Expanded(
+                child: InteractiveViewer(
+                  minScale: 0.5,
+                  maxScale: 8,
+                  child: Center(
+                    child: Image.file(
+                      File('${bridge.root}\\${record['ImagePath']}'),
+                      fit: BoxFit.contain,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+      return;
+    }
     showDialog<void>(context: context, builder: (context) => AlertDialog(
       title: Text('${record['Kind']} · ${record['CapturedAt']}'),
       content: SizedBox(width: 640, height: 420, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Text(record['Source'] as String), const SizedBox(height: 12),
-        Expanded(child: record['Kind'] == '图片'
-          ? InteractiveViewer(child: Image.file(File('${bridge.root}\\${record['ImagePath']}')))
-          : SingleChildScrollView(child: SelectableText(record['Text'] as String))),
+        Expanded(child: SingleChildScrollView(child: SelectableText(
+          record['Text'] as String,
+          style: const TextStyle(fontSize: 15, height: 1.5),
+        ))),
       ])),
       actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('关闭'))],
     ));
@@ -169,10 +216,39 @@ class _HistoryPageState extends State<HistoryPage> {
         onPressed: () => action('pin', record), icon: const Icon(Icons.push_pin_outlined, size: 16)),
       IconButton(tooltip: '删除', onPressed: () => action('delete', record), icon: const Icon(Icons.delete_outline, size: 18)),
     ];
-    final content = image ? Image.file(File('${bridge.root}\\${record['ImagePath']}'), fit: BoxFit.contain,
-      cacheWidth: 240, errorBuilder: (_, error, stack) => const Center(child: Text('图片读取失败')))
+    final content = image
+      ? Stack(
+          fit: StackFit.expand,
+          children: [
+            Image.file(
+              File('${bridge.root}\\${record['ImagePath']}'),
+              fit: BoxFit.contain,
+              cacheWidth: 240,
+              errorBuilder: (_, error, stack) => const Center(child: Text('图片读取失败')),
+            ),
+            Positioned(
+              right: 6,
+              bottom: 6,
+              child: IconButton(
+                tooltip: '预览图片',
+                onPressed: () => preview(record),
+                constraints: const BoxConstraints.tightFor(width: 32, height: 32),
+                padding: const EdgeInsets.all(6),
+                style: IconButton.styleFrom(
+                  backgroundColor: Colors.white,
+                  foregroundColor: const Color(0xFF52647D),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    side: const BorderSide(color: Color(0xFFCBD8E7)),
+                  ),
+                ),
+                icon: const Icon(Icons.zoom_in_outlined, size: 20),
+              ),
+            ),
+          ],
+        )
       : Text(record['Text'] as String, maxLines: dock ? 4 : 3, overflow: TextOverflow.ellipsis,
-          style: const TextStyle(fontSize: 13, height: 1.5, color: Color(0xFF18283E)));
+          style: const TextStyle(fontSize: 15, height: 1.5, color: Color(0xFF18283E)));
     return Card(margin: const EdgeInsets.all(4), elevation: 0,
       color: selected ? const Color(0xFFE8F0FF) : Colors.white,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12), side: BorderSide(
