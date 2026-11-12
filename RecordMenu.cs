@@ -5,7 +5,7 @@ using System.Windows.Forms;
 
 namespace ClipHistory
 {
-    internal enum RecordMenuIcon { Preview, Copy, Paste }
+    internal enum RecordMenuIcon { Preview, Copy, Paste, Pin, Unpin, Delete }
 
     internal sealed class RecordMenu : ContextMenuStrip
     {
@@ -30,6 +30,7 @@ namespace ClipHistory
             var item = new RecordMenuItem(text, icon) { AutoSize = false,
                 Size = new Size((int)Math.Ceiling(212 * scale), (int)Math.Ceiling(36 * scale)),
                 Margin = new Padding(0, (int)Math.Ceiling(scale), 0, (int)Math.Ceiling(scale)),
+                ForeColor = icon == RecordMenuIcon.Delete ? Color.FromArgb(190, 45, 45) : FluentStyle.Text,
                 Padding = Padding.Empty };
             item.Click += click;
             Items.Add(item);
@@ -52,6 +53,61 @@ namespace ClipHistory
                 Icon = icon;
                 AccessibleName = text;
             }
+        }
+
+        // 使用统一细线绘制查看、剪贴板、置顶和删除操作图标。
+        internal static void DrawIcon(Graphics graphics, Rectangle bounds, RecordMenuIcon icon, Color color)
+        {
+            GraphicsState state = graphics.Save();
+            graphics.TranslateTransform(bounds.X, bounds.Y);
+            graphics.ScaleTransform(bounds.Width / 20f, bounds.Height / 20f);
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var pen = new Pen(color, 1.1f))
+            {
+                pen.StartCap = pen.EndCap = LineCap.Round;
+                pen.LineJoin = LineJoin.Round;
+                if (icon == RecordMenuIcon.Preview)
+                {
+                    using (var eye = new GraphicsPath())
+                    {
+                        eye.AddBezier(1, 10, 5, 2, 15, 2, 19, 10);
+                        eye.AddBezier(19, 10, 15, 18, 5, 18, 1, 10);
+                        graphics.DrawPath(pen, eye);
+                    }
+                    graphics.DrawEllipse(pen, 7, 7, 6, 6);
+                }
+                else if (icon == RecordMenuIcon.Copy)
+                {
+                    graphics.DrawLines(pen, new[] { new Point(5, 14), new Point(2, 14),
+                        new Point(2, 2), new Point(14, 2), new Point(14, 5) });
+                    graphics.DrawRectangle(pen, 6, 6, 12, 12);
+                }
+                else if (icon == RecordMenuIcon.Paste)
+                {
+                    graphics.DrawLines(pen, new[] { new Point(6, 4), new Point(3, 4), new Point(3, 18),
+                        new Point(17, 18), new Point(17, 4), new Point(14, 4) });
+                    graphics.DrawRectangle(pen, 6, 2, 8, 4);
+                    graphics.DrawLine(pen, 7, 10, 13, 10);
+                    graphics.DrawLine(pen, 7, 14, 13, 14);
+                }
+                else if (icon == RecordMenuIcon.Pin || icon == RecordMenuIcon.Unpin)
+                {
+                    graphics.DrawLine(pen, 6, 3, 14, 3);
+                    graphics.DrawLines(pen, new[] { new Point(7, 3), new Point(7, 8), new Point(4, 12),
+                        new Point(16, 12), new Point(13, 8), new Point(13, 3) });
+                    graphics.DrawLine(pen, 10, 12, 10, 18);
+                    if (icon == RecordMenuIcon.Unpin) graphics.DrawLine(pen, 3, 3, 17, 17);
+                }
+                else if (icon == RecordMenuIcon.Delete)
+                {
+                    graphics.DrawLine(pen, 4, 5, 16, 5);
+                    graphics.DrawLines(pen, new[] { new Point(7, 5), new Point(7, 2), new Point(13, 2), new Point(13, 5) });
+                    graphics.DrawLines(pen, new[] { new Point(5, 7), new Point(6, 18), new Point(14, 18), new Point(15, 7) });
+                    graphics.DrawLine(pen, 8, 8, 8, 15);
+                    graphics.DrawLine(pen, 12, 8, 12, 15);
+                }
+            }
+            graphics.Restore(state);
         }
 
         private sealed class RecordMenuRenderer : TrayMenuRenderer
@@ -85,52 +141,14 @@ namespace ClipHistory
                 int iconSize = (int)Math.Round(18 * scale);
                 int textLeft = inset + iconSize + (int)Math.Round(10 * scale);
                 var icon = new Rectangle(inset, (e.Item.Height - iconSize) / 2, iconSize, iconSize);
-                DrawIcon(e.Graphics, icon, ((RecordMenuItem)e.Item).Icon);
+                DrawIcon(e.Graphics, icon, ((RecordMenuItem)e.Item).Icon, e.Item.ForeColor);
                 TextRenderer.DrawText(e.Graphics, e.Item.Text, e.TextFont,
                     new Rectangle(textLeft, 0, e.Item.Width - textLeft - inset, e.Item.Height),
-                    e.Item.Enabled ? FluentStyle.Text : FluentStyle.SecondaryText,
+                    e.Item.Enabled ? e.Item.ForeColor : FluentStyle.SecondaryText,
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine |
                     TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
             }
 
-            // 用细线绘制预览、复制和粘贴图标，与卡片操作图标保持一致。
-            private static void DrawIcon(Graphics graphics, Rectangle bounds, RecordMenuIcon icon)
-            {
-                GraphicsState state = graphics.Save();
-                graphics.TranslateTransform(bounds.X, bounds.Y);
-                graphics.ScaleTransform(bounds.Width / 20f, bounds.Height / 20f);
-                graphics.SmoothingMode = SmoothingMode.AntiAlias;
-                using (var pen = new Pen(FluentStyle.SecondaryText, 1.1f))
-                {
-                    pen.StartCap = pen.EndCap = LineCap.Round;
-                    pen.LineJoin = LineJoin.Round;
-                    if (icon == RecordMenuIcon.Preview)
-                    {
-                        using (var eye = new GraphicsPath())
-                        {
-                            eye.AddBezier(1, 10, 5, 2, 15, 2, 19, 10);
-                            eye.AddBezier(19, 10, 15, 18, 5, 18, 1, 10);
-                            graphics.DrawPath(pen, eye);
-                        }
-                        graphics.DrawEllipse(pen, 7, 7, 6, 6);
-                    }
-                    else if (icon == RecordMenuIcon.Copy)
-                    {
-                        graphics.DrawLines(pen, new[] { new Point(5, 14), new Point(2, 14),
-                            new Point(2, 2), new Point(14, 2), new Point(14, 5) });
-                        graphics.DrawRectangle(pen, 6, 6, 12, 12);
-                    }
-                    else
-                    {
-                        graphics.DrawLines(pen, new[] { new Point(6, 4), new Point(3, 4), new Point(3, 18),
-                            new Point(17, 18), new Point(17, 4), new Point(14, 4) });
-                        graphics.DrawRectangle(pen, 6, 2, 8, 4);
-                        graphics.DrawLine(pen, 7, 10, 13, 10);
-                        graphics.DrawLine(pen, 7, 14, 13, 14);
-                    }
-                }
-                graphics.Restore(state);
-            }
         }
     }
 }

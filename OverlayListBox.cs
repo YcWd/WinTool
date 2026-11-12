@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Drawing;
 using System.Windows.Forms;
 
@@ -6,21 +6,69 @@ namespace ClipHistory
 {
     internal sealed class OverlayListBox : ListBox
     {
+        internal const int CardMargin = 8;
+        internal int NormalItemHeight = 160 + CardMargin * 2;
+        internal Func<int, float> RemovalProgress;
         private readonly Control thumb = new Control();
         internal readonly Panel ScrollBar = new Panel { Dock = DockStyle.Right, Width = 12,
             BackColor = FluentStyle.Background, TabStop = false };
         private int dragOffset;
-        private int wheelDelta;
+        private double wheelRemainder;
+        private int scrollPosition;
         private bool updating;
         internal bool HorizontalCards { get; private set; }
         internal event EventHandler ViewScrolled;
 
-        // 滑块放在列表外的独立侧栏，保留原有滚动和拖动交互。
+        private int ItemExtent { get { return Math.Max(1, HorizontalCards ? ColumnWidth : NormalItemHeight); } }
+        private int Viewport { get { return HorizontalCards ? ClientSize.Width : ClientSize.Height; } }
+        private int MaximumScroll { get { return Math.Max(0, ItemStart(Items.Count) - Viewport); } }
+
+        // 删除中的记录逐步收起占位，后续卡片同步滑动补齐。
+        private int ItemLength(int index)
+        {
+            float progress = RemovalProgress == null ? 0 : RemovalProgress(index);
+            return (int)Math.Round(ItemExtent * (1 - progress));
+        }
+
+        // 绘制、滚动和点击统一累计动画中的实际占位长度。
+        private int ItemStart(int index)
+        {
+            int position = 0;
+            for (int item = 0; item < index; item++) position += ItemLength(item);
+            return position;
+        }
+
+        // 动画更新后同步滚动边界和滑块，再重绘可见记录。
+        internal void RefreshAnimationLayout()
+        {
+            ScrollPosition = scrollPosition;
+            UpdateScrollThumb();
+            Invalidate();
+        }
+
+        // 使用像素偏移绘制和命中卡片，滚动可以停在卡片中间。
+        internal int ScrollPosition
+        {
+            get { return scrollPosition; }
+            set
+            {
+                int position = Math.Max(0, Math.Min(MaximumScroll, value));
+                if (scrollPosition == position) return;
+                scrollPosition = position;
+                if (updating) return;
+                Invalidate();
+                UpdateScrollThumb();
+                if (ViewScrolled != null) ViewScrolled(this, EventArgs.Empty);
+            }
+        }
+
+        // 自行处理鼠标命中，滑块拖动与绘制共享同一像素偏移。
         internal OverlayListBox()
         {
-            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+            SetStyle(ControlStyles.UserPaint | ControlStyles.UserMouse | ControlStyles.AllPaintingInWmPaint |
                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
             thumb.BackColor = Color.FromArgb(153, 153, 153);
+            thumb.Paint += delegate(object sender, PaintEventArgs e) { e.Graphics.Clear(thumb.BackColor); };
             thumb.Cursor = Cursors.Hand;
             thumb.TabStop = false;
             thumb.AccessibleName = "滚动历史记录";
@@ -45,18 +93,16 @@ namespace ClipHistory
             {
                 if (e.Button != MouseButtons.Left) return;
                 Focus();
-                dragOffset = HorizontalCards ? e.X : e.Y;
+                dragOffset = e.Y;
                 thumb.Capture = true;
             };
             thumb.MouseMove += delegate
             {
                 if (!thumb.Capture) return;
-                int travel = HorizontalCards ? ScrollBar.ClientSize.Width - 8 - thumb.Width :
-                    ScrollBar.ClientSize.Height - 8 - thumb.Height;
+                int travel = ScrollBar.ClientSize.Height - 8 - thumb.Height;
                 if (travel <= 0) return;
-                Point mouse = ScrollBar.PointToClient(Control.MousePosition);
-                int position = (HorizontalCards ? mouse.X : mouse.Y) - dragOffset - 4;
-                TopIndex = (int)Math.Round(Math.Max(0, Math.Min(travel, position)) * (double)MaximumTopIndex / travel);
+                int position = ScrollBar.PointToClient(Control.MousePosition).Y - dragOffset - 4;
+                ScrollPosition = (int)Math.Round(Math.Max(0, Math.Min(travel, position)) * (double)MaximumScroll / travel);
             };
             thumb.MouseUp += delegate(object sender, MouseEventArgs e)
             {
@@ -65,38 +111,40 @@ namespace ClipHistory
             thumb.MouseCaptureChanged += delegate { thumb.BackColor = Color.FromArgb(153, 153, 153); };
         }
 
-        // 底部模式采用单行等宽列，继续使用原生选中、命中与键盘导航。
+        // 切换列表方向并重新计算卡片尺寸及像素范围。
         internal void SetHorizontalCards(bool enabled)
         {
             HorizontalCards = enabled;
-            wheelDelta = 0;
+            wheelRemainder = 0;
             ScrollBar.Dock = enabled ? DockStyle.Bottom : DockStyle.Right;
             if (enabled) ScrollBar.Height = 12; else ScrollBar.Width = 12;
             MultiColumn = enabled;
             ScrollBar.Visible = !enabled;
             UpdateCardSize();
-            if (Items.Count > 0) TopIndex = 0;
+            ScrollPosition = 0;
             UpdateScrollThumb();
             Invalidate();
         }
 
-        // 扣除四边各 4px 间距后，横排卡片保持 4:3，普通列表维持原行高。
+        // 横排按可用高度生成正方形，普通模式使用固定行高。
         private void UpdateCardSize()
         {
             if (HorizontalCards)
             {
-                int cardHeight = (Math.Max(11, Math.Min(255, ClientSize.Height)) - 8) / 3 * 3;
-                ItemHeight = cardHeight + 8;
-                ColumnWidth = cardHeight / 3 * 4 + 8;
+                ColumnWidth = Math.Max(1, ClientSize.Height);
+                // 原生行高上限为 255px，实际卡片高度由 ColumnWidth 绘制。
+                ItemHeight = Math.Min(255, ColumnWidth);
             }
-            else ItemHeight = 104;
+            else ItemHeight = Math.Min(255, NormalItemHeight);
         }
 
-        // 侧栏或窗口尺寸改变时同步 4:3 卡片和滑块尺寸。
+        // 窗口尺寸变化后收紧滚动边界，并同步卡片和滑块。
         protected override void OnSizeChanged(EventArgs e)
         {
             base.OnSizeChanged(e);
             if (HorizontalCards) UpdateCardSize();
+            if (!IsHandleCreated) return;
+            ScrollPosition = scrollPosition;
             UpdateScrollThumb();
         }
 
@@ -106,32 +154,99 @@ namespace ClipHistory
             get
             {
                 CreateParams parameters = base.CreateParams;
-                parameters.Style &= ~(0x00200000 | 0x00100000 | 0x00800000); // 滚动条及 WS_BORDER
-                parameters.ExStyle &= ~(0x00000200 | 0x00020000); // WS_EX_CLIENTEDGE | WS_EX_STATICEDGE
+                parameters.Style &= ~(0x00200000 | 0x00100000 | 0x00800000);
+                parameters.ExStyle &= ~(0x00000200 | 0x00020000);
                 return parameters;
             }
         }
 
-        private int MaximumTopIndex
+        // 绘制、滚动与鼠标命中共用卡片尺寸，首尾记录允许部分可见。
+        public new Rectangle GetItemRectangle(int index)
         {
-            get { return Math.Max(0, Items.Count - Math.Max(1, HorizontalCards ? ClientSize.Width / ColumnWidth : ClientSize.Height / ItemHeight)); }
+            if (index < 0 || index >= Items.Count) throw new ArgumentOutOfRangeException("index");
+            int position = ItemStart(index) - scrollPosition - (ItemExtent - ItemLength(index)) / 2;
+            return HorizontalCards ? new Rectangle(position, 0, ColumnWidth, ColumnWidth) :
+                new Rectangle(0, position, ClientSize.Width, ItemExtent);
         }
 
-        // 每个滚轮刻度移动一张卡片，累积触控板输入，避免一次跳过多张大卡片。
+        // 反算像素位置对应的记录，避免部分滚动后点击相邻卡片。
+        public new int IndexFromPoint(Point point)
+        {
+            if (!ClientRectangle.Contains(point)) return NoMatches;
+            int position = (HorizontalCards ? point.X : point.Y) + scrollPosition;
+            for (int index = 0; index < Items.Count; index++)
+            {
+                int length = ItemLength(index);
+                if (position < length) return index;
+                position -= length;
+            }
+            return NoMatches;
+        }
+
+        // 坐标重载与 Point 重载共用命中逻辑。
+        public new int IndexFromPoint(int x, int y)
+        {
+            return IndexFromPoint(new Point(x, y));
+        }
+
+        // 鼠标选中按绘制位置命中，保持当前像素偏移。
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left || e.Button == MouseButtons.Right)
+            {
+                Focus();
+                int index = IndexFromPoint(e.Location);
+                if (index != NoMatches) SelectedIndex = index;
+            }
+            base.OnMouseDown(e);
+        }
+
+        // 键盘导航显示目标记录，超出视口的大卡片按起始边缘对齐。
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            if (e.Handled || Items.Count == 0) return;
+            int index = SelectedIndex;
+            int page = Math.Max(1, Viewport / ItemExtent);
+            switch (e.KeyCode)
+            {
+                case Keys.Left:
+                case Keys.Up: index--; break;
+                case Keys.Right:
+                case Keys.Down: index++; break;
+                case Keys.PageUp: index -= page; break;
+                case Keys.PageDown: index += page; break;
+                case Keys.Home: index = 0; break;
+                case Keys.End: index = Items.Count - 1; break;
+                default: return;
+            }
+            SelectedIndex = Math.Max(0, Math.Min(Items.Count - 1, index));
+            int start = ItemStart(SelectedIndex);
+            if (start < scrollPosition || ItemExtent > Viewport) ScrollPosition = start;
+            else if (start + ItemExtent > scrollPosition + Viewport) ScrollPosition = start + ItemExtent - Viewport;
+            e.Handled = e.SuppressKeyPress = true;
+        }
+
+        // 原生选中状态改变后刷新自绘卡片。
+        protected override void OnSelectedIndexChanged(EventArgs e)
+        {
+            base.OnSelectedIndexChanged(e);
+            if (!updating) Invalidate();
+        }
+
+        // 按系统滚轮行数换算像素，保留触控板的小幅度输入。
         private void ScrollWheel(int delta)
         {
-            wheelDelta += delta;
-            int steps = wheelDelta / 120;
-            wheelDelta %= 120;
-            int lines = SystemInformation.MouseWheelScrollLines < 0 ? Math.Max(1,
-                HorizontalCards ? ClientSize.Width / ColumnWidth : ClientSize.Height / ItemHeight) : 1;
-            if (SystemInformation.MouseWheelScrollLines == 0) return;
-            if (steps == 0 || Items.Count == 0) return;
-            int top = Math.Max(0, Math.Min(MaximumTopIndex, TopIndex - steps * lines));
-            if (top != TopIndex) TopIndex = top;
+            int lines = SystemInformation.MouseWheelScrollLines;
+            if (lines == 0 || Items.Count == 0) return;
+            double distance = lines < 0 ? Viewport : Font.Height * lines;
+            wheelRemainder -= delta * distance / 120.0;
+            int pixels = (int)wheelRemainder;
+            wheelRemainder -= pixels;
+            ScrollPosition += pixels;
         }
 
-        // 底部模式不显示滑块，普通模式按可见比例更新侧栏滑块。
+        // 纵向滑块按实际内容长度和像素偏移计算，底部模式沿用横向滚动。
         internal void UpdateScrollThumb()
         {
             if (thumb == null || !IsHandleCreated || updating) return;
@@ -140,25 +255,22 @@ namespace ClipHistory
                 thumb.Visible = false;
                 return;
             }
-            int viewport = HorizontalCards ? ClientSize.Width : ClientSize.Height;
-            int extent = HorizontalCards ? ColumnWidth : ItemHeight;
-            int trackHeight = (HorizontalCards ? ScrollBar.ClientSize.Width : ScrollBar.ClientSize.Height) - 8;
-            bool overflow = Items.Count * (long)extent > viewport && trackHeight > 0;
+            int trackHeight = ScrollBar.ClientSize.Height - 8;
+            bool overflow = MaximumScroll > 0 && Viewport > 0 && trackHeight > 0;
             thumb.Visible = overflow;
             if (!overflow) return;
             int height = Math.Min(trackHeight, Math.Max(28,
-                (int)(trackHeight * (double)viewport / (Items.Count * (long)extent))));
-            int top = 4 + (int)Math.Round((trackHeight - height) * (double)TopIndex / Math.Max(1, MaximumTopIndex));
-            if (HorizontalCards) thumb.SetBounds(top, (ScrollBar.ClientSize.Height - 6) / 2, height, 6);
-            else thumb.SetBounds((ScrollBar.ClientSize.Width - 6) / 2, top, 6, height);
+                (int)(trackHeight * (double)Viewport / ItemStart(Items.Count))));
+            int top = 4 + (int)Math.Round((trackHeight - height) * (double)scrollPosition / MaximumScroll);
+            thumb.SetBounds((ScrollBar.ClientSize.Width - 6) / 2, top, 6, height);
             thumb.BringToFront();
         }
 
-        // 整个可见列表在同一缓冲区内绘制，背景和卡片一次提交到屏幕。
+        // 按动画后的坐标绘制可见记录，删除占位收起时也保持连续布局。
         protected override void OnPaint(PaintEventArgs e)
         {
-            e.Graphics.Clear(BackColor);
-            for (int index = TopIndex; index < Items.Count; index++)
+            FluentStyle.ClearBackground(e.Graphics, BackColor);
+            for (int index = 0; index < Items.Count; index++)
             {
                 Rectangle bounds = GetItemRectangle(index);
                 if (HorizontalCards ? bounds.Left >= ClientSize.Width : bounds.Top >= ClientSize.Height) break;
@@ -172,50 +284,42 @@ namespace ClipHistory
         // 背景随卡片一起绘制，避免独立清底造成闪烁。
         protected override void OnPaintBackground(PaintEventArgs e) { }
 
-        // 原生列表处理选中和内容更新后同步滑块，滚轮由自定义逻辑接管。
+        // 滚轮由像素逻辑接管，数据批量更新后统一同步滚动范围。
         protected override void WndProc(ref Message message)
         {
-            if (message.Msg == 0x020A) // WM_MOUSEWHEEL
+            if (message.Msg == 0x020A)
             {
                 ScrollWheel((short)(message.WParam.ToInt64() >> 16));
                 message.Result = IntPtr.Zero;
                 return;
             }
-            if (HorizontalCards && message.Msg == 0x020E) // WM_MOUSEHWHEEL
+            if (HorizontalCards && message.Msg == 0x020E)
             {
                 ScrollWheel(-(short)(message.WParam.ToInt64() >> 16));
                 message.Result = IntPtr.Zero;
                 return;
             }
-            if (message.Msg == 0x000B) updating = message.WParam == IntPtr.Zero;
-            bool scrolling = message.Msg == 0x0197 && !updating;
-            if (scrolling) NativeMethods.SendMessage(Handle, 0x000B, IntPtr.Zero, IntPtr.Zero);
-            base.WndProc(ref message);
-            if (scrolling)
+            // 自绘只由 OnPaint 提交，忽略原生列表按整行坐标发出的绘制请求。
+            if (message.Msg == 0x202B)
             {
-                NativeMethods.SendMessage(Handle, 0x000B, new IntPtr(1), IntPtr.Zero);
-                NativeMethods.InvalidateWithoutErase(Handle, ClientRectangle);
+                message.Result = new IntPtr(1);
+                return;
             }
-            if ((message.Msg == 0x0100 || message.Msg == 0x0115 || message.Msg == 0x0114) && !updating)
-                NativeMethods.InvalidateWithoutErase(Handle, ClientRectangle);
-            // 可见记录变化后通知卡片清除旧按钮的悬停状态。
-            if ((message.Msg == 0x0115 || message.Msg == 0x0114 || message.Msg == 0x0197 || message.Msg == 0x0100) && ViewScrolled != null)
-                ViewScrolled(this, EventArgs.Empty);
+            if (message.Msg == 0x000B) updating = message.WParam == IntPtr.Zero;
+            base.WndProc(ref message);
             switch (message.Msg)
             {
-                case 0x0005: // WM_SIZE
+                case 0x0007: // WM_SETFOCUS
+                case 0x0008: // WM_KILLFOCUS
                 case 0x000B: // WM_SETREDRAW
-                case 0x0100: // WM_KEYDOWN
-                case 0x0115: // WM_VSCROLL
-                case 0x0114: // WM_HSCROLL
                 case 0x0180: // LB_ADDSTRING
                 case 0x0181: // LB_INSERTSTRING
                 case 0x0182: // LB_DELETESTRING
                 case 0x0184: // LB_RESETCONTENT
-                case 0x0186: // LB_SETCURSEL
-                case 0x0197: // LB_SETTOPINDEX
                 case 0x01A7: // LB_SETCOUNT
+                    ScrollPosition = scrollPosition;
                     UpdateScrollThumb();
+                    if (!updating) Invalidate();
                     break;
             }
         }

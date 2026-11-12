@@ -1,4 +1,4 @@
-using System.Drawing;
+﻿using System.Drawing;
 using System.Drawing.Drawing2D;
 
 namespace ClipHistory
@@ -6,16 +6,23 @@ namespace ClipHistory
     internal static class FluentStyle
     {
         internal static readonly Color Background = Color.FromArgb(234, 240, 247);
+        internal static readonly Color GlassBackground = Color.Black;
         internal static readonly Color Surface = Color.White;
-        internal static readonly Color Text = Color.FromArgb(24, 40, 62);
-        internal static readonly Color SecondaryText = Color.FromArgb(82, 100, 125);
+        internal static readonly Color Text = Color.FromArgb(31, 41, 55);
+        internal static readonly Color SecondaryText = Color.FromArgb(75, 85, 99);
         internal static readonly Color Accent = Color.FromArgb(37, 99, 235);
         internal static readonly Color Border = Color.FromArgb(203, 216, 231);
-        internal static readonly Color ControlFill = Color.FromArgb(223, 232, 243);
+        internal static readonly Color ControlFill = Color.FromArgb(230, 234, 240);
         internal static readonly Color HoverSurface = Color.FromArgb(243, 247, 253);
         internal static readonly Color PressedSurface = Color.FromArgb(220, 232, 252);
         internal static readonly Color SelectedSurface = Color.FromArgb(232, 240, 255);
         internal static readonly Color HoverBorder = Color.FromArgb(143, 169, 204);
+
+        // DWM 客户区的黑色底色以零 Alpha 清理，其余表面按原颜色绘制。
+        internal static void ClearBackground(Graphics graphics, Color background)
+        {
+            graphics.Clear(background == GlassBackground ? Color.Transparent : background);
+        }
 
         // 绘制控件和记录卡片共用的圆角路径。
         internal static GraphicsPath RoundedRectangle(Rectangle rectangle, int radius)

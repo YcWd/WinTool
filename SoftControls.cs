@@ -1,10 +1,33 @@
-using System;
+﻿using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Windows.Forms;
 
 namespace ClipHistory
 {
+    internal sealed class FluentLabel : Label
+    {
+        // 使用带 Alpha 的 GDI+ 文字，适配毛玻璃背景。
+        internal FluentLabel()
+        {
+            UseCompatibleTextRendering = true;
+            DoubleBuffered = true;
+        }
+
+        // 清理透明背景，避免标签四周出现不透明底色。
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            FluentStyle.ClearBackground(e.Graphics, BackColor);
+        }
+
+        // 灰度抗锯齿保持小字号文字在毛玻璃上的清晰度。
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+            base.OnPaint(e);
+        }
+    }
+
     internal sealed class ToggleSwitch : CheckBox
     {
         // 保留复选框的空格键和无障碍状态，绘制右侧开关。
@@ -19,7 +42,7 @@ namespace ClipHistory
         // 标签与开关居中排列，键盘焦点使用浅色圆角边线。
         protected override void OnPaint(PaintEventArgs e)
         {
-            e.Graphics.Clear(Parent.BackColor);
+            FluentStyle.ClearBackground(e.Graphics, Parent.BackColor);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             var track = new Rectangle(Width - 42, (Height - 22) / 2, 40, 22);
             using (var path = FluentStyle.RoundedRectangle(track, 11))
@@ -42,9 +65,9 @@ namespace ClipHistory
         // 用父容器底色清理四角，再绘制分段控件的圆角底板。
         protected override void OnPaintBackground(PaintEventArgs e)
         {
-            e.Graphics.Clear(Parent.BackColor);
+            FluentStyle.ClearBackground(e.Graphics, Parent.BackColor);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            using (var path = FluentStyle.RoundedRectangle(new Rectangle(0, 0, Width - 1, Height - 1), 10))
+            using (var path = FluentStyle.RoundedRectangle(new Rectangle(0, 0, Width - 1, Height - 1), 12))
             using (var brush = new SolidBrush(BackColor)) e.Graphics.FillPath(brush, path);
         }
     }
@@ -63,12 +86,13 @@ namespace ClipHistory
             MouseLeave += delegate { hovered = false; Invalidate(); };
         }
 
-        // 蓝底白字突出当前选项，禁用时使用灰色文字，保留键盘焦点提示。
+        // 浅色底板配深色文字，蓝底白字选中态使用 Alpha 抗锯齿绘制。
         protected override void OnPaint(PaintEventArgs e)
         {
-            e.Graphics.Clear(Parent.BackColor);
+            FluentStyle.ClearBackground(e.Graphics, Parent.BackColor);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            using (var path = FluentStyle.RoundedRectangle(new Rectangle(1, 1, Width - 3, Height - 3), 7))
+            e.Graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+            using (var path = FluentStyle.RoundedRectangle(new Rectangle(1, 1, Width - 3, Height - 3), 8))
             {
                 if (Enabled && (Checked || hovered))
                     using (var brush = new SolidBrush(Checked ? FluentStyle.Accent : FluentStyle.Surface))
@@ -76,8 +100,10 @@ namespace ClipHistory
                 if (Enabled && Focused && ShowFocusCues)
                     using (var pen = new Pen(Checked ? Color.White : FluentStyle.Accent)) e.Graphics.DrawPath(pen, path);
             }
-            TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, Enabled && Checked ? Color.White : FluentStyle.SecondaryText,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+            using (var format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center,
+                FormatFlags = StringFormatFlags.NoWrap, Trimming = StringTrimming.EllipsisCharacter })
+            using (var brush = new SolidBrush(!Enabled ? FluentStyle.SecondaryText : Checked ? Color.White : FluentStyle.Text))
+                e.Graphics.DrawString(Text, Font, brush, ClientRectangle, format);
         }
     }
 
@@ -116,7 +142,7 @@ namespace ClipHistory
         // 输入表面以细边线分层，聚焦时使用蓝色强调。
         protected override void OnPaint(PaintEventArgs e)
         {
-            e.Graphics.Clear(Parent.BackColor);
+            FluentStyle.ClearBackground(e.Graphics, Parent.BackColor);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             using (var path = FluentStyle.RoundedRectangle(new Rectangle(1, 1, Width - 3, Height - 3), 10))
             {
@@ -159,7 +185,7 @@ namespace ClipHistory
         // 搜索框保留清晰的边界，聚焦时强调蓝色，图标保持垂直居中。
         protected override void OnPaint(PaintEventArgs e)
         {
-            e.Graphics.Clear(Parent.BackColor);
+            FluentStyle.ClearBackground(e.Graphics, Parent.BackColor);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             using (var path = FluentStyle.RoundedRectangle(new Rectangle(1, 1, Width - 3, Height - 3), 10))
             {

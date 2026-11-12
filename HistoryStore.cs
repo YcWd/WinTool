@@ -23,6 +23,7 @@ namespace ClipHistory
         [DataMember] public string[] Files { get; set; }
         [DataMember] public string ImagePath { get; set; }
         [DataMember] public string Source { get; set; }
+        [DataMember(EmitDefaultValue = false)] public string SourceExecutable { get; set; }
         [DataMember] public string Fingerprint { get; set; }
         [DataMember] public string Revision { get; set; }
         [DataMember] public bool IsPinned { get; set; }

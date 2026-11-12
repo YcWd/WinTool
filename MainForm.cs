@@ -4,6 +4,7 @@ using System.Collections.Specialized;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Runtime.Serialization;
@@ -16,6 +17,15 @@ namespace ClipHistory
     {
         private readonly HistoryStore store = new HistoryStore();
         private readonly ThumbnailCache thumbnails;
+        private readonly Dictionary<string, Icon> sourceIcons = new Dictionary<string, Icon>(StringComparer.OrdinalIgnoreCase);
+        private readonly Queue<string> sourceIconOrder = new Queue<string>();
+        private readonly int recordHeaderHeight;
+        private const int RecordCardRadius = 20;
+        private const int HoverTransitionDuration = 160;
+        private const int DeleteTransitionDuration = 200;
+        private readonly Dictionary<string, RecordAnimation> recordAnimations = new Dictionary<string, RecordAnimation>();
+        private readonly Stopwatch animationClock = Stopwatch.StartNew();
+        private long lastAnimationFrame;
         private Bitmap rowBuffer;
         private readonly Dictionary<string, string[]> previewLines = new Dictionary<string, string[]>();
         private Size previewSize;
@@ -25,9 +35,9 @@ namespace ClipHistory
         private List<ClipRecord> filteredRecords = new List<ClipRecord>();
         private readonly RadioButton[] kindTabs = new RadioButton[4];
         private string selectedKind = "全部类型";
-        private readonly Label status = new Label();
+        private readonly Label status = new FluentLabel();
         private readonly RowStyle feedbackRow = new RowStyle(SizeType.Absolute, 0);
-        private readonly Label emptyState = new Label();
+        private readonly Label emptyState = new FluentLabel();
         private readonly ToolTip tips = new ToolTip();
         private readonly Button pinButton = new FluentButton();
         private readonly Icon applicationIcon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath);
@@ -43,20 +53,23 @@ namespace ClipHistory
         private TableLayoutPanel layout;
         private Panel heading;
         private FlowLayoutPanel windowActions;
-        private RoundedPanel tabSurface;
+        private Panel tabSurface;
+        private TableLayoutPanel compactActions;
         private TableLayoutPanel toolbar;
         private SearchField searchField;
         private Button reset;
         private readonly TableLayoutPanel compactHeader = new TableLayoutPanel { Dock = DockStyle.Fill,
-            ColumnCount = 6, RowCount = 1, Margin = Padding.Empty, Padding = new Padding(0, 6, 0, 6), BackColor = FluentStyle.Background };
+            ColumnCount = 3, RowCount = 1, Margin = Padding.Empty, Padding = new Padding(0, 6, 0, 6), BackColor = FluentStyle.Background };
         private readonly NotifyIcon tray = new NotifyIcon();
         private readonly Timer foregroundTimer = new Timer { Interval = 150 };
         private readonly Timer clipboardRetry = new Timer { Interval = 60 };
         private readonly Timer filterTimer = new Timer { Interval = 250 };
         private readonly Timer pasteTimer = new Timer { Interval = 50 };
-        private readonly Font titleFont = new Font("Microsoft YaHei UI", 10);
+        private readonly Timer animationTimer = new Timer { Interval = 16 };
+        private readonly Font titleFont = new Font("Microsoft YaHei UI", 10, FontStyle.Bold);
         private readonly Font symbolFont = new Font("Segoe MDL2 Assets", 10);
         private readonly Font rowFont = new Font("Microsoft YaHei UI", 10, FontStyle.Regular);
+        private readonly Font contentFont = new Font("Microsoft YaHei UI", 12, FontStyle.Regular);
         private readonly Font smallFont = new Font("Microsoft YaHei UI", 9, FontStyle.Regular);
         private readonly bool startInTray;
         private IntPtr targetWindow;
@@ -70,7 +83,16 @@ namespace ClipHistory
         private bool writingClipboard;
         private int hoveredRecord = ListBox.NoMatches;
         private RecordAction hoveredAction = RecordAction.None;
-        private enum RecordAction { None = -1, More, Pin, Delete }
+        private enum RecordAction { None = -1, Preview, Delete, Pin }
+
+        private sealed class RecordAnimation
+        {
+            internal float Hover;
+            internal float TargetHover;
+            internal float DeleteProgress;
+            internal long DeleteStarted;
+            internal ClipRecord DeletingRecord;
+        }
         private readonly uint currentProcessId = (uint)Process.GetCurrentProcess().Id;
         private readonly Color ink = FluentStyle.Text;
         private readonly Color muted = FluentStyle.SecondaryText;
@@ -80,6 +102,15 @@ namespace ClipHistory
         internal MainForm(bool trayOnly)
         {
             thumbnails = new ThumbnailCache(store);
+            using (var graphics = Graphics.FromHwnd(IntPtr.Zero))
+            {
+                recordHeaderHeight = Math.Max(52, (int)Math.Ceiling(rowFont.GetHeight(graphics)) +
+                    (int)Math.Ceiling(smallFont.GetHeight(graphics)) + 18);
+                records.NormalItemHeight = Math.Max(160, recordHeaderHeight +
+                    (int)Math.Ceiling(contentFont.GetHeight(graphics)) * 2 +
+                    (int)Math.Ceiling(4 * graphics.DpiY / 96f) + 26) + OverlayListBox.CardMargin * 2;
+            }
+            records.RemovalProgress = GetRecordRemovalProgress;
             startInTray = trayOnly;
             settings = AppSettings.Load(store.Root);
             store.SetRecordLimit(settings.RecordLimit);
@@ -101,6 +132,7 @@ namespace ClipHistory
             clipboardRetry.Tick += delegate { CaptureClipboard(); };
             filterTimer.Tick += delegate { filterTimer.Stop(); ReloadRecords(); };
             pasteTimer.Tick += delegate { CompletePaste(); };
+            animationTimer.Tick += delegate { AnimateRecords(); };
             foregroundTimer.Start();
             Shown += delegate
             {
@@ -137,11 +169,17 @@ namespace ClipHistory
             Controls.Add(layout);
 
             heading = new Panel { Dock = DockStyle.Fill, Margin = Padding.Empty, BackColor = BackColor };
-            var title = new Label { Text = "剪贴记录", Font = titleFont, AutoSize = true, Location = new Point(4, 6) };
+            var title = new FluentLabel { Text = "剪贴记录", Font = titleFont, AutoSize = true,
+                UseCompatibleTextRendering = true, Location = new Point(4, 6) };
             heading.Controls.Add(title);
+            heading.SizeChanged += delegate { title.Top = (heading.ClientSize.Height - title.Height) / 2; };
             heading.MouseDown += DragWindow;
             title.MouseDown += DragWindow;
             windowActions = new FlowLayoutPanel { Dock = DockStyle.Right, Width = 144, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, Margin = Padding.Empty };
+            windowActions.SizeChanged += delegate
+            {
+                windowActions.Padding = new Padding(0, Math.Max(0, (windowActions.ClientSize.Height - 28) / 2), 0, 0);
+            };
             pinButton.Text = "\uE718";
             pinButton.Size = new Size(32, 28);
             pinButton.Font = symbolFont;
@@ -178,10 +216,10 @@ namespace ClipHistory
             heading.Controls.Add(windowActions);
             layout.Controls.Add(heading, 0, 0);
 
-            tabSurface = new RoundedPanel { Dock = DockStyle.Fill, BackColor = FluentStyle.ControlFill,
-                Padding = new Padding(3), Margin = new Padding(0, 3, 0, 7) };
+            tabSurface = new Panel { Dock = DockStyle.Fill, BackColor = BackColor,
+                Margin = new Padding(0, 3, 0, 7) };
             var tabs = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 4, RowCount = 1,
-                Margin = Padding.Empty, BackColor = FluentStyle.ControlFill, AccessibleName = "记录类型筛选" };
+                Margin = Padding.Empty, BackColor = BackColor, AccessibleName = "记录类型筛选" };
             tabs.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             tabSurface.Controls.Add(tabs);
             string[] typeNames = { "全部类型", "文本", "图片", "文件" };
@@ -191,7 +229,7 @@ namespace ClipHistory
                 string kind = typeNames[index];
                 var tab = new SegmentTab { Text = index == 0 ? "全部" : kind, Tag = kind,
                     Dock = DockStyle.Fill, Appearance = Appearance.Button, FlatStyle = FlatStyle.Flat,
-                    TextAlign = ContentAlignment.MiddleCenter, Font = smallFont, ForeColor = muted,
+                    TextAlign = ContentAlignment.MiddleCenter, Font = rowFont, ForeColor = ink,
                     Margin = new Padding(1, 0, 1, 0), Cursor = Cursors.Hand, AccessibleName = "筛选：" + kind };
                 tab.FlatAppearance.BorderSize = 0;
                 tab.FlatAppearance.CheckedBackColor = FluentStyle.Surface;
@@ -213,19 +251,16 @@ namespace ClipHistory
             records.BackColor = BackColor;
             records.Cursor = Cursors.Hand;
             records.DrawMode = DrawMode.OwnerDrawFixed;
-            records.ItemHeight = 104;
             records.IntegralHeight = false;
-            records.AccessibleName = "剪贴板历史记录，Enter 粘贴，Ctrl+P 切换记录置顶，Delete 删除，Shift+F10 打开更多菜单";
+            records.AccessibleName = "剪贴板历史记录，Enter 粘贴，Ctrl+P 切换记录置顶，Delete 删除，右键或 Shift+F10 打开记录菜单";
             records.DrawItem += DrawRecord;
             records.MouseUp += RecordMouseUp;
             records.MouseMove += delegate(object sender, MouseEventArgs e)
             {
-                int index = records.IndexFromPoint(e.Location);
-                UpdateHoveredRecord(index, index == ListBox.NoMatches ? RecordAction.None :
-                    HitRecordAction(records.GetItemRectangle(index), e.Location));
+                TrackHoveredRecord(e.Location);
             };
             records.MouseLeave += delegate { UpdateHoveredRecord(ListBox.NoMatches, RecordAction.None); };
-            records.ViewScrolled += delegate { UpdateHoveredRecord(ListBox.NoMatches, RecordAction.None); };
+            records.ViewScrolled += delegate { TrackHoveredRecord(records.PointToClient(Control.MousePosition)); };
             records.KeyDown += delegate(object sender, KeyEventArgs e)
             {
                 if (e.KeyCode == Keys.Enter && records.SelectedItem != null)
@@ -236,8 +271,8 @@ namespace ClipHistory
                 else if ((e.KeyCode == Keys.Apps || (e.Shift && e.KeyCode == Keys.F10)) && records.SelectedItem != null)
                 {
                     e.Handled = e.SuppressKeyPress = true;
-                    Rectangle more = RecordActionBounds(records.GetItemRectangle(records.SelectedIndex), RecordAction.More);
-                    ShowRecordMenu((ClipRecord)records.SelectedItem, new Point(more.Right, more.Bottom + 2));
+                    Rectangle visible = Rectangle.Intersect(records.GetItemRectangle(records.SelectedIndex), records.ClientRectangle);
+                    ShowRecordMenu((ClipRecord)records.SelectedItem, new Point(visible.Right, visible.Top));
                 }
                 else if (e.Control && e.KeyCode == Keys.P && records.SelectedItem != null)
                 {
@@ -253,7 +288,8 @@ namespace ClipHistory
             listContent.Controls.Add(records);
             emptyState.Dock = DockStyle.Fill;
             emptyState.TextAlign = ContentAlignment.MiddleCenter;
-            emptyState.ForeColor = muted;
+            emptyState.ForeColor = ink;
+            emptyState.UseCompatibleTextRendering = true;
             emptyState.Text = "暂无记录";
             emptyState.Visible = false;
             listContent.Controls.Add(emptyState);
@@ -265,13 +301,14 @@ namespace ClipHistory
             toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             toolbar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 54));
             search.Font = rowFont;
+            search.ForeColor = ink;
             search.AccessibleName = "搜索历史记录的内容、文件名或来源窗口";
             search.TextChanged += delegate { ScheduleFilter(); };
             searchField = new SearchField(search) { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 8, 0) };
             toolbar.Controls.Add(searchField, 0, 0);
             reset = CreateButton("重置", 50);
             reset.Dock = DockStyle.Fill;
-            reset.Font = smallFont;
+            reset.Font = rowFont;
             reset.BackColor = FluentStyle.Surface;
             reset.Margin = Padding.Empty;
             reset.Click += delegate { search.Clear(); kindTabs[0].Checked = true; ScheduleFilter(); };
@@ -281,19 +318,25 @@ namespace ClipHistory
             status.Dock = DockStyle.Fill;
             status.Margin = Padding.Empty;
             status.Font = smallFont;
-            status.ForeColor = muted;
+            status.ForeColor = ink;
+            status.UseCompatibleTextRendering = true;
             status.AutoEllipsis = true;
             status.Visible = false;
             layout.Controls.Add(status, 0, 4);
             compactHeader.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            foreach (int width in new[] { 96, 248, 256, 54 })
-                compactHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, width));
-            compactHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            compactHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 144));
+            compactHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            compactHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 558));
+            compactHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            compactActions = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1,
+                Margin = Padding.Empty, BackColor = BackColor };
+            compactActions.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            foreach (int width in new[] { 248, 256, 54 })
+                compactActions.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, width));
+            compactHeader.Controls.Add(compactActions, 1, 0);
             compactHeader.MouseDown += DragWindow;
         }
 
-        // 底部模式合并为单行工具栏，重置按钮随顶栏使用窗口底色。
+        // 底部模式将搜索、标签和重置作为一组水平居中，窗口操作在右侧垂直居中。
         private void ArrangeHeader()
         {
             layout.SuspendLayout();
@@ -302,10 +345,10 @@ namespace ClipHistory
             if (bottomLayout)
             {
                 compactHeader.Controls.Add(heading, 0, 0);
-                compactHeader.Controls.Add(searchField, 1, 0);
-                compactHeader.Controls.Add(tabSurface, 2, 0);
-                compactHeader.Controls.Add(reset, 3, 0);
-                compactHeader.Controls.Add(windowActions, 5, 0);
+                compactActions.Controls.Add(searchField, 0, 0);
+                compactActions.Controls.Add(tabSurface, 1, 0);
+                compactActions.Controls.Add(reset, 2, 0);
+                compactHeader.Controls.Add(windowActions, 2, 0);
                 layout.Controls.Add(compactHeader, 0, 0);
                 toolbar.Visible = false;
                 tabSurface.Margin = new Padding(0, 0, 8, 0);
@@ -382,6 +425,17 @@ namespace ClipHistory
             {
                 Hide();
             }
+        }
+
+        // 搜索框或记录列表获得焦点时，Esc 均沿用窗口关闭流程收起到托盘。
+        protected override bool ProcessCmdKey(ref Message message, Keys keyData)
+        {
+            if (keyData == Keys.Escape)
+            {
+                Close();
+                return true;
+            }
+            return base.ProcessCmdKey(ref message, keyData);
         }
 
         // 无系统标题栏时，通过顶部空白或应用名称拖动窗口。
@@ -577,12 +631,12 @@ namespace ClipHistory
             UpdateEmptyState();
         }
 
-        // 固定到当前屏幕工作区底部，避开任务栏并适应屏幕尺寸变化。
+        // 固定到当前屏幕工作区底部，左、右、下各保留 20px 间隙。
         private void PositionBottomWindow()
         {
             Rectangle area = Screen.FromControl(this).WorkingArea;
-            int height = Math.Min(260, area.Height);
-            var bounds = new Rectangle(area.Left, area.Bottom - height, area.Width, height);
+            int height = Math.Min(320, area.Height - 20);
+            var bounds = new Rectangle(area.Left + 20, area.Bottom - height - 20, area.Width - 40, height);
             if (Bounds != bounds) Bounds = bounds;
         }
 
@@ -594,11 +648,31 @@ namespace ClipHistory
             tray.Text = "剪贴记录 · " + settings.HotkeyText;
         }
 
+        // 为主窗口和已创建的背景容器同步系统毛玻璃底色。
+        private void ApplyWindowBackground()
+        {
+            Color background = NativeMethods.ApplyAcrylicBackground(Handle, !SystemInformation.HighContrast) ?
+                FluentStyle.GlassBackground : FluentStyle.Background;
+            Color previous = BackColor;
+            if (previous == background) return;
+            UpdateBackgroundColors(this, previous, background);
+            UpdateBackgroundColors(compactHeader, previous, background);
+            Invalidate(true);
+        }
+
+        // 只更新使用窗口底色的控件，统一普通布局和底部布局的合成背景。
+        private void UpdateBackgroundColors(Control control, Color previous, Color background)
+        {
+            if (control.BackColor == previous) control.BackColor = background;
+            foreach (Control child in control.Controls) UpdateBackgroundColors(child, previous, background);
+        }
+
         // 初始化系统窗口效果、剪贴板通知和全局快捷键。
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
             NativeMethods.ApplyWindowChrome(Handle);
+            ApplyWindowBackground();
             NativeMethods.SetWindowPos(Handle, IntPtr.Zero, 0, 0, 0, 0, 0x0037);
             if (!NativeMethods.AddClipboardFormatListener(Handle))
                 throw new InvalidOperationException("无法注册剪贴板监听。");
@@ -622,8 +696,11 @@ namespace ClipHistory
                 message.Result = IntPtr.Zero;
                 return;
             }
-            if (message.Msg == NativeMethods.WM_DWMCOMPOSITIONCHANGED)
+            if (message.Msg == NativeMethods.WM_DWMCOMPOSITIONCHANGED || message.Msg == 0x031A || message.Msg == 0x001A)
+            {
                 NativeMethods.ApplyWindowChrome(Handle);
+                ApplyWindowBackground();
+            }
             if (message.Msg == 0x84)
             {
                 base.WndProc(ref message);
@@ -697,9 +774,11 @@ namespace ClipHistory
             {
                 IDataObject data = Clipboard.GetDataObject();
                 if (data == null) return;
+                IntPtr sourceWindow = NativeMethods.GetForegroundWindow();
                 var source = new StringBuilder(256);
-                NativeMethods.GetWindowText(NativeMethods.GetForegroundWindow(), source, source.Capacity);
-                var record = new ClipRecord { Id = Guid.NewGuid().ToString("N"), CapturedAt = DateTime.Now.ToString("o"), Source = source.ToString() };
+                NativeMethods.GetWindowText(sourceWindow, source, source.Capacity);
+                var record = new ClipRecord { Id = Guid.NewGuid().ToString("N"), CapturedAt = DateTime.Now.ToString("o"),
+                    Source = source.ToString(), SourceExecutable = NativeMethods.GetWindowExecutable(sourceWindow) };
                 Bitmap image = null;
                 try
                 {
@@ -769,37 +848,63 @@ namespace ClipHistory
             catch (SerializationException exception) { SetStatus("历史日志格式损坏：" + exception.Message); }
         }
 
-        // 一次展示全部筛选结果，继续复用列表的滚动和选中状态。
+        // 刷新筛选结果时按像素恢复滚动位置，保留部分可见的卡片。
         private void ShowRecords(bool preservePosition)
         {
-            int topIndex = preservePosition ? records.TopIndex : 0;
+            int scrollPosition = preservePosition ? records.ScrollPosition : 0;
             var selected = preservePosition ? records.SelectedItem as ClipRecord : null;
             records.BeginUpdate();
             records.Items.Clear();
             previewLines.Clear();
             hoveredRecord = ListBox.NoMatches;
             hoveredAction = RecordAction.None;
+            var idleAnimations = new List<string>();
+            foreach (var entry in recordAnimations)
+                if (entry.Value.DeletingRecord == null) idleAnimations.Add(entry.Key);
+            foreach (string id in idleAnimations) recordAnimations.Remove(id);
             tips.SetToolTip(records, "");
             records.Items.AddRange(filteredRecords.ToArray());
             if (selected != null)
                 records.SelectedIndex = filteredRecords.FindIndex(item => item.Id == selected.Id);
-            if (filteredRecords.Count > 0) records.TopIndex = Math.Min(topIndex, filteredRecords.Count - 1);
+            records.ScrollPosition = scrollPosition;
             records.EndUpdate();
             UpdateEmptyState();
+            if (Visible) TrackHoveredRecord(records.PointToClient(Control.MousePosition));
         }
 
-        // 更新卡片与操作按钮的悬停提示，只重绘受影响的行。
+        // 鼠标移动或列表滚动后，按实际卡片区域更新悬停状态。
+        private void TrackHoveredRecord(Point location)
+        {
+            int index = records.IndexFromPoint(location);
+            if (index != ListBox.NoMatches &&
+                (IsDeletingRecord((ClipRecord)records.Items[index]) ||
+                !Rectangle.Inflate(records.GetItemRectangle(index), -OverlayListBox.CardMargin, -OverlayListBox.CardMargin).Contains(location)))
+                index = ListBox.NoMatches;
+            RecordAction action = index == ListBox.NoMatches ? RecordAction.None :
+                HitRecordAction(records.GetItemRectangle(index), location);
+            UpdateHoveredRecord(index, action);
+        }
+
+        // 更新悬停目标和按钮提示，通过动画平滑显示或隐藏卡片操作。
         private void UpdateHoveredRecord(int index, RecordAction action)
         {
             if (index == hoveredRecord && action == hoveredAction) return;
             int previous = hoveredRecord;
+            if (previous != index)
+            {
+                if (previous >= 0 && previous < records.Items.Count)
+                    GetRecordAnimation((ClipRecord)records.Items[previous]).TargetHover = 0;
+                if (index != ListBox.NoMatches)
+                    GetRecordAnimation((ClipRecord)records.Items[index]).TargetHover = 1;
+                StartRecordAnimation();
+            }
             hoveredRecord = index;
             hoveredAction = action;
-            string hint = "";
-            if (action == RecordAction.More) hint = "更多操作";
+            string hint = index == ListBox.NoMatches ? "" : "右键打开记录菜单";
+            if (action == RecordAction.Preview) hint = "预览完整内容";
+            else if (action == RecordAction.Delete) hint = "删除记录（Delete）";
             else if (action == RecordAction.Pin)
-                hint = ((ClipRecord)records.Items[index]).IsPinned ? "取消置顶（Ctrl+P）" : "置顶，清除缓存时保留（Ctrl+P）";
-            else if (action == RecordAction.Delete) hint = "删除这条记录（Delete）";
+                hint = ((ClipRecord)records.Items[index]).IsPinned ? "取消置顶（Ctrl+P）" : "置顶记录（Ctrl+P）";
             tips.SetToolTip(records, hint);
             foreach (int row in new[] { previous, index })
             {
@@ -810,139 +915,280 @@ namespace ClipHistory
             }
         }
 
-        // 用独立位图绘制整行，避免原生列表的设备上下文残留边线。
+        // 按记录 ID 保存过渡状态，刷新和排序后仍能继续完成删除。
+        private RecordAnimation GetRecordAnimation(ClipRecord record)
+        {
+            RecordAnimation animation;
+            if (!recordAnimations.TryGetValue(record.Id, out animation))
+            {
+                animation = new RecordAnimation();
+                recordAnimations.Add(record.Id, animation);
+            }
+            return animation;
+        }
+
+        // 删除动画期间暂停该记录的重复操作。
+        private bool IsDeletingRecord(ClipRecord record)
+        {
+            RecordAnimation animation;
+            return recordAnimations.TryGetValue(record.Id, out animation) && animation.DeletingRecord != null;
+        }
+
+        // 列表按同一删除进度收起占位，绘制和点击位置保持一致。
+        private float GetRecordRemovalProgress(int index)
+        {
+            RecordAnimation animation;
+            return recordAnimations.TryGetValue(((ClipRecord)records.Items[index]).Id, out animation) ? animation.DeleteProgress : 0;
+        }
+
+        // 仅在存在过渡时启动计时，静止卡片不持续重绘。
+        private void StartRecordAnimation()
+        {
+            if (animationTimer.Enabled) return;
+            lastAnimationFrame = animationClock.ElapsedMilliseconds;
+            animationTimer.Start();
+        }
+
+        // 推进悬停、删除和相邻卡片位移，消失后执行实际删除。
+        private void AnimateRecords()
+        {
+            long now = animationClock.ElapsedMilliseconds;
+            float step = (now - lastAnimationFrame) / (float)HoverTransitionDuration;
+            lastAnimationFrame = now;
+            var idle = new List<string>();
+            var completed = new List<string>();
+            foreach (var entry in recordAnimations)
+            {
+                RecordAnimation animation = entry.Value;
+                animation.Hover = animation.Hover < animation.TargetHover ?
+                    Math.Min(animation.TargetHover, animation.Hover + step) : Math.Max(animation.TargetHover, animation.Hover - step);
+                if (animation.DeletingRecord != null)
+                {
+                    float progress = Math.Min(1, (now - animation.DeleteStarted) / (float)DeleteTransitionDuration);
+                    animation.DeleteProgress = EaseTransition(progress);
+                    if (progress == 1) completed.Add(entry.Key);
+                }
+                else if (animation.Hover == 0 && animation.TargetHover == 0) idle.Add(entry.Key);
+            }
+            foreach (string id in idle) recordAnimations.Remove(id);
+            string deletionError = null;
+            foreach (string id in completed)
+            {
+                ClipRecord record = recordAnimations[id].DeletingRecord;
+                recordAnimations.Remove(id);
+                string error = CompleteRecordDeletion(record);
+                if (error != null) deletionError = error;
+            }
+            records.RefreshAnimationLayout();
+            if (deletionError != null) SetStatus(deletionError);
+            if (Visible) TrackHoveredRecord(records.PointToClient(Control.MousePosition));
+            bool running = false;
+            foreach (RecordAnimation animation in recordAnimations.Values)
+            {
+                if (animation.DeletingRecord != null || animation.Hover != animation.TargetHover)
+                {
+                    running = true;
+                    break;
+                }
+            }
+            if (!running) animationTimer.Stop();
+        }
+
+        // 首尾速度平缓的缓动曲线，供颜色、按钮和删除动画共用。
+        private static float EaseTransition(float progress)
+        {
+            return progress * progress * (3 - 2 * progress);
+        }
+
+        // 在两种颜色之间连续插值，避免悬停时直接跳变。
+        private static Color BlendColor(Color from, Color to, float progress)
+        {
+            return Color.FromArgb((int)Math.Round(from.R + (to.R - from.R) * progress),
+                (int)Math.Round(from.G + (to.G - from.G) * progress),
+                (int)Math.Round(from.B + (to.B - from.B) * progress));
+        }
+
+        // 缓冲整张卡片，删除时围绕中心缩放并淡出。
         private void DrawRecord(object sender, DrawItemEventArgs e)
         {
             if (e.Index < 0) return;
             if (rowBuffer == null || rowBuffer.Size != e.Bounds.Size)
             {
                 if (rowBuffer != null) rowBuffer.Dispose();
-                // 卡片背景始终不透明，行缓冲使用 RGB 位图。
-                rowBuffer = new Bitmap(e.Bounds.Width, e.Bounds.Height, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+                // 行缓冲保留 Alpha，使卡片间隙和阴影参与系统背景合成。
+                rowBuffer = new Bitmap(e.Bounds.Width, e.Bounds.Height, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
                 rowBuffer.SetResolution(e.Graphics.DpiX, e.Graphics.DpiY);
             }
             using (var graphics = Graphics.FromImage(rowBuffer))
             {
-                graphics.Clear(records.BackColor);
+                FluentStyle.ClearBackground(graphics, records.BackColor);
                 var bufferedArgs = new DrawItemEventArgs(graphics, e.Font,
                     new Rectangle(Point.Empty, e.Bounds.Size), e.Index, e.State, e.ForeColor, e.BackColor);
                 PaintRecord(bufferedArgs);
             }
-            e.Graphics.DrawImageUnscaled(rowBuffer, e.Bounds.Location);
+            RecordAnimation animation;
+            float removal = recordAnimations.TryGetValue(((ClipRecord)records.Items[e.Index]).Id, out animation) ? animation.DeleteProgress : 0;
+            if (removal == 0)
+                e.Graphics.DrawImageUnscaled(rowBuffer, e.Bounds.Location);
+            else if (removal < 1)
+            {
+                float scale = 1 - removal;
+                var destination = new RectangleF(e.Bounds.X + e.Bounds.Width * removal / 2,
+                    e.Bounds.Y + e.Bounds.Height * removal / 2, e.Bounds.Width * scale, e.Bounds.Height * scale);
+                using (var attributes = new ImageAttributes())
+                {
+                    GraphicsState state = e.Graphics.Save();
+                    e.Graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    attributes.SetColorMatrix(new ColorMatrix { Matrix33 = scale });
+                    PointF[] corners = { new PointF(destination.Left, destination.Top),
+                        new PointF(destination.Right, destination.Top), new PointF(destination.Left, destination.Bottom) };
+                    e.Graphics.DrawImage(rowBuffer, corners, new RectangleF(0, 0, rowBuffer.Width, rowBuffer.Height), GraphicsUnit.Pixel, attributes);
+                    e.Graphics.Restore(state);
+                }
+            }
         }
 
-        // 白色卡片始终保留细边线，选中和悬停使用蓝色层级区分。
+        // 悬停以蓝色阴影、来源栏加深和内容高亮突出卡片。
         private void PaintRecord(DrawItemEventArgs e)
         {
             var record = (ClipRecord)records.Items[e.Index];
             bool selected = (e.State & DrawItemState.Selected) != 0;
+            RecordAnimation animation;
+            recordAnimations.TryGetValue(record.Id, out animation);
+            float hover = animation == null ? 0 : EaseTransition(animation.Hover);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             e.Graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
-            using (var brush = new SolidBrush(records.BackColor)) e.Graphics.FillRectangle(brush, e.Bounds);
-            var card = new Rectangle(e.Bounds.X + 4, e.Bounds.Y + 4, e.Bounds.Width - 8, e.Bounds.Height - 8);
-            using (var path = FluentStyle.RoundedRectangle(card, 12))
-            using (var brush = new SolidBrush(selected ? FluentStyle.SelectedSurface :
-                hoveredRecord == e.Index ? FluentStyle.HoverSurface : FluentStyle.Surface))
+            Rectangle card = Rectangle.Inflate(e.Bounds, -OverlayListBox.CardMargin, -OverlayListBox.CardMargin);
+            for (int spread = 5; spread >= 0; spread--)
+            {
+                Rectangle shadow = Rectangle.Inflate(card, spread, spread);
+                shadow.Offset(0, 2);
+                using (var path = FluentStyle.RoundedRectangle(shadow, RecordCardRadius + spread))
+                using (var brush = new SolidBrush(Color.FromArgb((int)Math.Round(7 - spread + (8 - spread) * hover), BlendColor(ink, accent, hover))))
+                    e.Graphics.FillPath(brush, path);
+            }
+            using (var path = FluentStyle.RoundedRectangle(card, RecordCardRadius))
+            using (var brush = new SolidBrush(selected ? FluentStyle.PressedSurface :
+                BlendColor(FluentStyle.Surface, FluentStyle.SelectedSurface, hover)))
             {
                 e.Graphics.FillPath(brush, path);
-                using (var pen = new Pen(selected ? accent : hoveredRecord == e.Index ? FluentStyle.HoverBorder : FluentStyle.Border,
-                    selected && records.Focused ? 1.5f : 1f)) e.Graphics.DrawPath(pen, path);
-            }
-            if (record.Kind == "图片")
-                DrawImageRecord(e.Graphics, card, record);
-            else
-                DrawPreviewText(e.Graphics, record.Preview, bottomLayout ?
-                    new Rectangle(card.X + 14, card.Y + 44, card.Width - 28, card.Height - 58) :
-                    new Rectangle(card.X + 14, card.Y + 13, card.Width - 58, card.Height - 26));
-            DrawRecordAction(e, RecordAction.More, false);
-            DrawRecordAction(e, RecordAction.Pin, record.IsPinned);
-            DrawRecordAction(e, RecordAction.Delete, false);
-        }
-
-        // 保留圆角按钮状态，图标统一使用细线绘制。
-        private void DrawRecordAction(DrawItemEventArgs e, RecordAction action, bool active)
-        {
-            Rectangle bounds = RecordActionBounds(e.Bounds, action);
-            bool hovered = hoveredRecord == e.Index && hoveredAction == action;
-            bool deleting = hovered && action == RecordAction.Delete;
-            Color color = deleting ? Color.FromArgb(190, 45, 45) : active ? accent : muted;
-            if (hovered || active)
-            {
-                Color fill = deleting ? Color.FromArgb(255, 235, 235) : active ?
-                    Color.FromArgb(222, 234, 255) : FluentStyle.ControlFill;
-                using (var path = FluentStyle.RoundedRectangle(bounds, 8))
-                using (var brush = new SolidBrush(fill)) e.Graphics.FillPath(brush, path);
-            }
-            DrawRecordIcon(e.Graphics, bounds, action, active, color);
-        }
-
-        // 绘制细圆点、轮廓图钉和垃圾桶，避免字体图标的小尺寸粗重边缘。
-        private static void DrawRecordIcon(Graphics graphics, Rectangle bounds, RecordAction action, bool active, Color color)
-        {
-            float size = Math.Min(16f * graphics.DpiX / 96f, bounds.Height - 8f);
-            GraphicsState state = graphics.Save();
-            graphics.TranslateTransform(bounds.X + (bounds.Width - size) / 2f, bounds.Y + (bounds.Height - size) / 2f);
-            graphics.ScaleTransform(size / 16f, size / 16f);
-            graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            if (action == RecordAction.More)
-            {
-                using (var brush = new SolidBrush(color))
-                    for (int dot = 0; dot < 3; dot++)
-                        graphics.FillEllipse(brush, 3.3f + dot * 4f, 7.3f, 1.4f, 1.4f);
-            }
-            else
-            {
-                using (var pen = new Pen(color, 1f))
+                GraphicsState state = e.Graphics.Save();
+                e.Graphics.SetClip(path, CombineMode.Intersect);
+                DrawRecordHeader(e.Graphics, card, record, hover);
+                if (record.Kind == "图片")
                 {
-                    pen.StartCap = pen.EndCap = LineCap.Round;
-                    pen.LineJoin = LineJoin.Round;
-                    if (action == RecordAction.Pin)
-                    {
-                        if (!active)
-                        {
-                            graphics.TranslateTransform(8, 8);
-                            graphics.RotateTransform(30);
-                            graphics.TranslateTransform(-8, -8);
-                        }
-                        graphics.DrawLine(pen, 4, 2, 12, 2);
-                        graphics.DrawLines(pen, new[] { new Point(5, 2), new Point(5, 6), new Point(3, 10),
-                            new Point(13, 10), new Point(11, 6), new Point(11, 2) });
-                        graphics.DrawLine(pen, 8, 10, 8, 14);
-                    }
-                    else
-                    {
-                        graphics.DrawLine(pen, 3, 4, 13, 4);
-                        graphics.DrawLines(pen, new[] { new Point(6, 4), new Point(6, 2),
-                            new Point(10, 2), new Point(10, 4) });
-                        graphics.DrawLines(pen, new[] { new PointF(4, 6), new PointF(4.8f, 14),
-                            new PointF(11.2f, 14), new PointF(12, 6) });
-                        graphics.DrawLine(pen, 6.5f, 6.5f, 7, 11.5f);
-                        graphics.DrawLine(pen, 9.5f, 6.5f, 9, 11.5f);
-                    }
+                    DrawImageRecord(e.Graphics, card, record);
+                    if (selected || hover > 0)
+                        using (var selection = new SolidBrush(Color.FromArgb((int)Math.Round(selected ? 48 + 12 * hover : 36 * hover), accent)))
+                            e.Graphics.FillRectangle(selection, ImageBounds(card));
                 }
+                else
+                    DrawPreviewText(e.Graphics, record.Preview, bottomLayout ?
+                        new Rectangle(card.X + 14, card.Y + recordHeaderHeight + 12, card.Width - 28, card.Height - recordHeaderHeight - 58) :
+                        new Rectangle(card.X + 14, card.Y + recordHeaderHeight + 12, card.Width - 148, card.Height - recordHeaderHeight - 26));
+                e.Graphics.Restore(state);
             }
-            graphics.Restore(state);
+            if (hover > 0 && (animation == null || animation.DeletingRecord == null))
+                for (RecordAction action = RecordAction.Preview; action <= RecordAction.Pin; action++)
+                    DrawRecordAction(e, action, record, hover);
         }
 
-        // 横排 4:3 卡片的操作放在顶端，普通卡片保留右侧纵排操作。
-        private Rectangle RecordActionBounds(Rectangle row, RecordAction action)
+        // 来源栏展示程序图标、类型、时间和置顶状态，悬停时同步加深底色。
+        private void DrawRecordHeader(Graphics graphics, Rectangle card, ClipRecord record, float hover)
         {
-            if (bottomLayout) return new Rectangle(row.Right - 108 + (int)action * 32, row.Top + 8, 32, 28);
-            return new Rectangle(row.Right - 40, row.Top + 8 + (int)action * 30, 32, 28);
+            Color color = record.Kind == "图片" ? Color.FromArgb(208, 51, 69) :
+                record.Kind == "文件" ? Color.FromArgb(0, 118, 178) : accent;
+            color = BlendColor(color, ControlPaint.Dark(color, 0.08f), hover);
+            using (var brush = new SolidBrush(color))
+                graphics.FillRectangle(brush, card.X, card.Y, card.Width, recordHeaderHeight);
+            Icon icon = GetSourceIcon(record);
+            var iconArea = new Rectangle(card.Right - recordHeaderHeight, card.Top, recordHeaderHeight, recordHeaderHeight);
+            using (var brush = new SolidBrush(Color.FromArgb(36, Color.White))) graphics.FillRectangle(brush, iconArea);
+            Rectangle iconPlate = Rectangle.Inflate(iconArea, -4, -4);
+            using (var path = FluentStyle.RoundedRectangle(iconPlate, 12))
+            using (var brush = new SolidBrush(Color.FromArgb(245, Color.White))) graphics.FillPath(brush, path);
+            int size = Math.Min(iconPlate.Width - 8, (int)Math.Round(40 * graphics.DpiX / 96f));
+            graphics.DrawIcon(icon, new Rectangle(iconArea.X + (iconArea.Width - size) / 2,
+                iconArea.Y + (iconArea.Height - size) / 2, size, size));
+            int textWidth = card.Width - 28 - recordHeaderHeight;
+            using (var format = new StringFormat { FormatFlags = StringFormatFlags.NoWrap,
+                LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter })
+            using (var titleBrush = new SolidBrush(Color.White))
+            using (var detailBrush = new SolidBrush(Color.FromArgb(230, Color.White)))
+            {
+                int titleHeight = (int)Math.Ceiling(rowFont.GetHeight(graphics)) + 2;
+                int detailHeight = (int)Math.Ceiling(smallFont.GetHeight(graphics)) + 2;
+                graphics.DrawString(string.IsNullOrEmpty(record.Source) ? record.Kind : record.Source,
+                    rowFont, titleBrush, new Rectangle(card.X + 14, card.Y + 6, textWidth, titleHeight), format);
+                graphics.DrawString((record.IsPinned ? "已置顶 · " : "") + record.Kind + " · " + record.LocalTime.ToString("HH:mm"),
+                    smallFont, detailBrush, new Rectangle(card.X + 14, card.Y + titleHeight + 8, textWidth, detailHeight), format);
+            }
         }
 
-        // 按固定按钮区域判断操作，内容区域继续用于直接粘贴。
-        private RecordAction HitRecordAction(Rectangle row, Point location)
+        // 旧记录通过同名窗口补取程序图标，无法识别时显示通用应用图标。
+        private Icon GetSourceIcon(ClipRecord record)
         {
-            for (RecordAction action = RecordAction.More; action <= RecordAction.Delete; action++)
+            string executable = record.SourceExecutable;
+            string key = string.IsNullOrEmpty(executable) ? "window:" + record.Source : executable;
+            Icon icon;
+            if (sourceIcons.TryGetValue(key, out icon)) return icon;
+            if (sourceIcons.Count == 48)
+            {
+                string oldest = sourceIconOrder.Dequeue();
+                sourceIcons[oldest].Dispose();
+                sourceIcons.Remove(oldest);
+            }
+            if (string.IsNullOrEmpty(executable) && !string.IsNullOrEmpty(record.Source))
+                executable = NativeMethods.GetWindowExecutable(NativeMethods.FindWindow(null, record.Source));
+            icon = string.IsNullOrEmpty(executable) ? null : NativeMethods.LoadApplicationIcon(executable);
+            if (icon == null) icon = (Icon)SystemIcons.Application.Clone();
+            sourceIcons.Add(key, icon);
+            sourceIconOrder.Enqueue(key);
+            return icon;
+        }
+
+        // 悬停按钮统一位于右下角，普通列表的文本为按钮预留右侧空间。
+        private static Rectangle RecordActionBounds(Rectangle row, RecordAction action)
+        {
+            Rectangle card = Rectangle.Inflate(row, -OverlayListBox.CardMargin, -OverlayListBox.CardMargin);
+            return new Rectangle(card.Right - 116 + (int)action * 36, card.Bottom - 44, 32, 32);
+        }
+
+        // 点击与绘制使用同一组预览、删除和置顶按钮区域。
+        private static RecordAction HitRecordAction(Rectangle row, Point location)
+        {
+            for (RecordAction action = RecordAction.Preview; action <= RecordAction.Pin; action++)
                 if (RecordActionBounds(row, action).Contains(location)) return action;
             return RecordAction.None;
         }
 
-        // 缓存当前页的文字排版，滚动和悬停时直接绘制，末行保留省略号。
+        // 图标按钮随悬停淡入淡出，置顶和删除使用各自的状态颜色。
+        private void DrawRecordAction(DrawItemEventArgs e, RecordAction action, ClipRecord record, float opacity)
+        {
+            Rectangle bounds = RecordActionBounds(e.Bounds, action);
+            bool hovered = hoveredRecord == e.Index && hoveredAction == action;
+            bool pinned = action == RecordAction.Pin && record.IsPinned;
+            Color fill = pinned ? FluentStyle.SelectedSurface : hovered ? FluentStyle.ControlFill : FluentStyle.Surface;
+            Color color = pinned ? accent : ink;
+            if (action == RecordAction.Delete)
+            {
+                color = Color.FromArgb(190, 45, 45);
+                if (hovered) fill = Color.FromArgb(255, 235, 235);
+            }
+            using (var path = FluentStyle.RoundedRectangle(bounds, 9))
+            using (var brush = new SolidBrush(Color.FromArgb((int)Math.Round(245 * opacity), fill)))
+                e.Graphics.FillPath(brush, path);
+            RecordMenuIcon icon = action == RecordAction.Preview ? RecordMenuIcon.Preview :
+                action == RecordAction.Delete ? RecordMenuIcon.Delete : pinned ? RecordMenuIcon.Unpin : RecordMenuIcon.Pin;
+            int size = Math.Min(24, (int)Math.Round(20 * e.Graphics.DpiX / 96f));
+            var iconBounds = new Rectangle(bounds.X + (bounds.Width - size) / 2, bounds.Y + (bounds.Height - size) / 2, size, size);
+            RecordMenu.DrawIcon(e.Graphics, iconBounds, icon, Color.FromArgb((int)Math.Round(255 * opacity), color));
+        }
+
+        // 普通模式最多展示两行正文，缓存排版并在末行超出时显示省略号。
         private void DrawPreviewText(Graphics graphics, string text, Rectangle bounds)
         {
-            int textHeight = (int)Math.Ceiling(rowFont.GetHeight(graphics));
+            int textHeight = (int)Math.Ceiling(contentFont.GetHeight(graphics));
             int gap = (int)Math.Ceiling(4 * graphics.DpiY / 96f);
             int lineHeight = textHeight + gap;
             if (previewSize != bounds.Size || previewLineHeight != lineHeight)
@@ -956,13 +1202,14 @@ namespace ClipHistory
             {
                 var linesToDraw = new List<string>();
                 int lineCount = (bounds.Height + gap) / lineHeight;
+                if (!bottomLayout) lineCount = Math.Min(2, lineCount);
                 int offset = 0;
                 using (var measureFormat = new StringFormat { FormatFlags = StringFormatFlags.LineLimit })
                 {
                     for (int line = 0; line < lineCount && offset < text.Length; line++)
                     {
                         int fitted, lines;
-                        graphics.MeasureString(text.Substring(offset), rowFont,
+                        graphics.MeasureString(text.Substring(offset), contentFont,
                             new SizeF(bounds.Width, textHeight), measureFormat, out fitted, out lines);
                         if (fitted == 0) break;
                         string visibleText = text.Substring(offset, fitted).TrimEnd('\r', '\n');
@@ -980,82 +1227,81 @@ namespace ClipHistory
             {
                 for (int line = 0; line < visibleLines.Length; line++)
                 {
-                    graphics.DrawString(visibleLines[line], rowFont, brush,
+                    graphics.DrawString(visibleLines[line], contentFont, brush,
                         new RectangleF(bounds.X, bounds.Y + line * lineHeight, bounds.Width, textHeight), drawFormat);
                 }
             }
         }
 
-        // 图片等比例展示，横排卡片将尺寸说明放在图片下方。
+        // 来源栏下方的整块区域用于图片内容。
+        private Rectangle ImageBounds(Rectangle card)
+        {
+            return new Rectangle(card.X, card.Y + recordHeaderHeight, card.Width, card.Height - recordHeaderHeight);
+        }
+
+        // 图片居中裁切铺满内容区，尺寸说明以半透明浮层显示。
         private void DrawImageRecord(Graphics graphics, Rectangle card, ClipRecord record)
         {
-            var preview = bottomLayout ? new Rectangle(card.X + 12, card.Y + 44, card.Width - 24, card.Height - 82) :
-                new Rectangle(card.X + 12, card.Y + 12, 116, card.Height - 24);
+            Rectangle preview = ImageBounds(card);
             Bitmap thumbnail = thumbnails.Get(record);
-            using (var path = FluentStyle.RoundedRectangle(preview, 8))
+            using (var brush = new SolidBrush(FluentStyle.Background)) graphics.FillRectangle(brush, preview);
+            if (thumbnail != null)
             {
-                using (var brush = new SolidBrush(FluentStyle.Background)) graphics.FillPath(brush, path);
-                if (thumbnail != null)
-                {
-                    double scale = Math.Min(preview.Width / (double)thumbnail.Width, preview.Height / (double)thumbnail.Height);
-                    int width = Math.Max(1, (int)(thumbnail.Width * scale));
-                    int height = Math.Max(1, (int)(thumbnail.Height * scale));
-                    GraphicsState state = graphics.Save();
-                    graphics.SetClip(path);
-                    graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                    graphics.DrawImage(thumbnail, new Rectangle(preview.X + (preview.Width - width) / 2,
-                        preview.Y + (preview.Height - height) / 2, width, height));
-                    graphics.Restore(state);
-                }
+                float scale = Math.Max(preview.Width / (float)thumbnail.Width, preview.Height / (float)thumbnail.Height);
+                float sourceWidth = preview.Width / scale, sourceHeight = preview.Height / scale;
+                var source = new RectangleF((thumbnail.Width - sourceWidth) / 2,
+                    (thumbnail.Height - sourceHeight) / 2, sourceWidth, sourceHeight);
+                graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                graphics.DrawImage(thumbnail, (RectangleF)preview, source, GraphicsUnit.Pixel);
             }
-            var caption = bottomLayout ? new Rectangle(card.Left + 12, preview.Bottom + 4, card.Width - 24, 24) :
-                new Rectangle(preview.Right + 16, card.Top + 24, card.Right - preview.Right - 58, 24);
+            string detail = thumbnail == null ? "缩略图不可用" : record.Preview.Replace("图片", "").Trim();
+            var caption = new Rectangle(preview.Left + 8, preview.Top + 8,
+                Math.Min(preview.Width - 16, (int)Math.Ceiling(graphics.MeasureString(detail, smallFont).Width) + 12),
+                (int)Math.Ceiling(smallFont.GetHeight(graphics)) + 8);
+            using (var path = FluentStyle.RoundedRectangle(caption, 8))
+            using (var brush = new SolidBrush(Color.FromArgb(170, 24, 32, 44))) graphics.FillPath(brush, path);
+            caption.Inflate(-6, 0);
             using (var format = new StringFormat { FormatFlags = StringFormatFlags.NoWrap,
                 LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter })
-            using (var titleBrush = new SolidBrush(ink))
-            using (var detailBrush = new SolidBrush(muted))
+            using (var detailBrush = new SolidBrush(Color.White))
             {
-                if (!bottomLayout)
-                {
-                    graphics.DrawString("图片", rowFont, titleBrush, caption, format);
-                    caption.Y += 26;
-                }
-                graphics.DrawString(thumbnail == null ? "缩略图不可用" : record.Preview.Replace("图片", "").Trim(),
-                    smallFont, detailBrush, caption, format);
+                graphics.DrawString(detail, smallFont, detailBrush, caption, format);
             }
         }
 
-        // 卡片按钮分别打开更多、切换置顶或删除，点击内容仍直接粘贴。
+        // 左键按按钮区域执行操作或粘贴内容，右键打开记录菜单。
         private void RecordMouseUp(object sender, MouseEventArgs e)
         {
             int index = records.IndexFromPoint(e.Location);
             if (index == ListBox.NoMatches) return;
             records.SelectedIndex = index;
             var record = (ClipRecord)records.Items[index];
-            Rectangle bounds = records.GetItemRectangle(index);
-            RecordAction action = HitRecordAction(bounds, e.Location);
+            if (IsDeletingRecord(record)) return;
             if (e.Button == MouseButtons.Right)
                 ShowRecordMenu(record, e.Location);
             else if (e.Button == MouseButtons.Left)
             {
-                if (action == RecordAction.More)
-                {
-                    Rectangle more = RecordActionBounds(bounds, action);
-                    ShowRecordMenu(record, new Point(more.Right, more.Bottom + 2));
-                }
-                else if (action == RecordAction.Pin) ToggleRecordPin(record);
+                RecordAction action = hoveredRecord == index ?
+                    HitRecordAction(records.GetItemRectangle(index), e.Location) : RecordAction.None;
+                if (action == RecordAction.Preview) PreviewRecord(record);
                 else if (action == RecordAction.Delete) DeleteRecord(record);
+                else if (action == RecordAction.Pin) ToggleRecordPin(record);
                 else PasteRecord(record);
             }
         }
 
-        // 使用紧凑的图标菜单展示当前记录的查看、复制和粘贴操作。
+        // 右键菜单集中提供查看、复制、粘贴、置顶和删除操作。
         private void ShowRecordMenu(ClipRecord record, Point location)
         {
+            if (IsDeletingRecord(record)) return;
             var menu = new RecordMenu(rowFont);
             menu.AddAction("查看完整内容", RecordMenuIcon.Preview, delegate { PreviewRecord(record); });
             menu.AddAction("复制到剪贴板", RecordMenuIcon.Copy, delegate { if (WriteClipboard(record)) ClearStatus(); });
             menu.AddAction("粘贴到目标窗口", RecordMenuIcon.Paste, delegate { PasteRecord(record); });
+            menu.Items.Add(new ToolStripSeparator());
+            menu.AddAction(record.IsPinned ? "取消置顶" : "置顶记录", record.IsPinned ? RecordMenuIcon.Unpin : RecordMenuIcon.Pin,
+                delegate { ToggleRecordPin(record); });
+            menu.AddAction("删除记录", RecordMenuIcon.Delete, delegate { DeleteRecord(record); });
             menu.Closed += delegate { BeginInvoke(new Action(menu.Dispose)); };
             menu.Show(records, location, ToolStripDropDownDirection.BelowLeft);
         }
@@ -1063,6 +1309,7 @@ namespace ClipHistory
         // 保存记录置顶状态并刷新当前筛选结果的顺序。
         private void ToggleRecordPin(ClipRecord record)
         {
+            if (IsDeletingRecord(record)) return;
             try
             {
                 store.SetPinned(record, !record.IsPinned);
@@ -1073,8 +1320,20 @@ namespace ClipHistory
             catch (SerializationException exception) { SetStatus("历史日志格式损坏：" + exception.Message); }
         }
 
-        // 删除当前单条记录，释放缩略图并刷新列表。
+        // 先缩放淡出卡片，动画结束后再删除该记录。
         private void DeleteRecord(ClipRecord record)
+        {
+            if (IsDeletingRecord(record)) return;
+            RecordAnimation animation = GetRecordAnimation(record);
+            animation.DeletingRecord = record;
+            animation.DeleteStarted = animationClock.ElapsedMilliseconds;
+            animation.TargetHover = 0;
+            StartRecordAnimation();
+            records.Invalidate();
+        }
+
+        // 实际删除后刷新当前位置，保存失败时由现有日志恢复可见记录。
+        private string CompleteRecordDeletion(ClipRecord record)
         {
             string error = null;
             try { store.Delete(record); }
@@ -1084,17 +1343,25 @@ namespace ClipHistory
             finally
             {
                 thumbnails.Clear();
-                ReloadRecords();
+                ReloadRecords(true);
             }
-            if (error != null) SetStatus(error);
+            return error;
         }
 
-        // 展示完整文本、文件路径或图片。
+        // 展示完整文本、文件路径或图片，Esc 关闭预览窗口。
         private void PreviewRecord(ClipRecord record)
         {
+            if (IsDeletingRecord(record)) return;
             using (var preview = new Form { Text = record.Kind + " · " + record.LocalTime.ToString("yyyy-MM-dd HH:mm:ss"),
-                Size = new Size(600, 440), StartPosition = FormStartPosition.CenterParent, Font = rowFont, Icon = applicationIcon })
+                Size = new Size(600, 440), StartPosition = FormStartPosition.CenterParent, Font = contentFont,
+                Icon = applicationIcon, KeyPreview = true })
             {
+                preview.KeyDown += delegate(object sender, KeyEventArgs e)
+                {
+                    if (e.KeyCode != Keys.Escape) return;
+                    e.Handled = e.SuppressKeyPress = true;
+                    preview.Close();
+                };
                 var details = new Label { Text = record.Source, Dock = DockStyle.Top, Height = 32,
                     Padding = new Padding(10, 6, 10, 0), Font = smallFont, ForeColor = muted, AutoEllipsis = true };
                 if (record.Kind == "图片")
@@ -1164,6 +1431,7 @@ namespace ClipHistory
         // 恢复原窗口的焦点后再发送粘贴，避免误贴到历史界面。
         private void PasteRecord(ClipRecord record)
         {
+            if (IsDeletingRecord(record)) return;
             if (pasteTimer.Enabled) return;
             if (!NativeMethods.IsWindow(targetWindow))
             {
@@ -1262,7 +1530,9 @@ namespace ClipHistory
                 clipboardRetry.Dispose();
                 filterTimer.Dispose();
                 pasteTimer.Dispose();
+                animationTimer.Dispose();
                 thumbnails.Dispose();
+                foreach (Icon icon in sourceIcons.Values) icon.Dispose();
                 if (rowBuffer != null) rowBuffer.Dispose();
                 tips.Dispose();
                 tray.Visible = false;
@@ -1277,6 +1547,7 @@ namespace ClipHistory
                 titleFont.Dispose();
                 symbolFont.Dispose();
                 rowFont.Dispose();
+                contentFont.Dispose();
                 smallFont.Dispose();
             }
         }

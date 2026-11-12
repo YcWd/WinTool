@@ -14,7 +14,7 @@ namespace ClipHistory
 
         internal ThumbnailCache(HistoryStore historyStore) { store = historyStore; }
 
-        // 仅为可见记录生成等比例小图，最多缓存 48 张并释放淘汰项。
+        // 为铺满卡片生成最长边 512px 的等比例预览，最多缓存 48 张。
         internal Bitmap Get(ClipRecord record)
         {
             Bitmap thumbnail;
@@ -36,7 +36,7 @@ namespace ClipHistory
             {
                 using (source)
                 {
-                    double scale = Math.Min(1, Math.Min(240.0 / source.Width, 144.0 / source.Height));
+                    double scale = Math.Min(1, 512.0 / Math.Max(source.Width, source.Height));
                     thumbnail = new Bitmap(Math.Max(1, (int)(source.Width * scale)), Math.Max(1, (int)(source.Height * scale)));
                     using (var graphics = Graphics.FromImage(thumbnail))
                     {
